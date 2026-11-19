@@ -1,0 +1,245 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ---------- Identity and trusted roles ----------
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    function userPath(uid) {
+      return /databases/$(database)/documents/users/$(uid);
+    }
+
+    function hasUserDoc() {
+      return signedIn() && exists(userPath(request.auth.uid));
+    }
+
+    function currentRole() {
+      return get(userPath(request.auth.uid)).data.role;
+    }
+
+    function isOwner() {
+      return hasUserDoc() && currentRole() == 'owner';
+    }
+
+    function isAdmin() {
+      return hasUserDoc() && currentRole() in ['owner', 'admin'];
+    }
+
+    function isStaff() {
+      return hasUserDoc() && currentRole() in ['owner', 'admin', 'staff', 'orders', 'accountant', 'support'];
+    }
+
+    function isSelf(uid) {
+      return signedIn() && request.auth.uid == uid;
+    }
+
+    // Client-side registration may create only a basic client profile.
+    // Owner/staff accounts MUST be provisioned by a trusted Admin SDK process.
+    function validNewClient(uid) {
+      return isSelf(uid)
+        && request.resource.data.keys().hasOnly([
+          'uid', 'role', 'displayName', 'email', 'createdAt', 'updatedAt'
+        ])
+        && request.resource.data.keys().hasAll([
+          'uid', 'role', 'displayName', 'email', 'createdAt', 'updatedAt'
+        ])
+        && request.resource.data.uid == uid
+        && request.resource.data.role == 'client'
+        && request.resource.data.displayName is string
+        && request.resource.data.displayName.size() >= 2
+        && request.resource.data.displayName.size() <= 80
+        && request.resource.data.email is string
+        && request.resource.data.email.size() <= 254
+        && request.resource.data.createdAt == request.time
+        && request.resource.data.updatedAt == request.time;
+    }
+
+    // ---------- Public site content ----------
+    match /site/main {
+      allow read: if true;
+      allow create, update, delete: if isAdmin();
+    }
+
+    // Never expose private configuration (payment credentials, internal notes,
+    // secrets, unpublished settings) to every authenticated account.
+    match /site/private {
+      allow read, write: if isAdmin();
+    }
+
+    // ---------- User profiles ----------
+    match /users/{uid} {
+      allow get: if isSelf(uid) || isStaff();
+      allow list: if isAdmin();
+
+      allow create: if validNewClient(uid);
+
+      // A client may update only a small set of profile fields.
+      // Role, email, wallet, balance, permissions and verification are not client-editable.
+      allow update: if (
+        isSelf(uid)
+        && request.resource.data.role == resource.data.role
+        && request.resource.data.uid == resource.data.uid
+        && request.resource.data.email == resource.data.email
+        && request.resource.data.diff(resource.data).affectedKeys()
+          .hasOnly(['displayName', 'phone', 'photoURL', 'updatedAt'])
+        && request.resource.data.displayName is string
+        && request.resource.data.displayName.size() >= 2
+        && request.resource.data.displayName.size() <= 80
+        && request.resource.data.updatedAt == request.time
+      ) || (
+        isOwner()
+        && request.resource.data.uid == resource.data.uid
+        && request.resource.data.role in ['owner', 'admin', 'staff', 'client']
+      ) || (
+        isAdmin()
+        && resource.data.role in ['client', 'staff', 'orders', 'accountant', 'support']
+        && request.resource.data.role in ['client', 'staff', 'orders', 'accountant', 'support']
+        && request.resource.data.uid == resource.data.uid
+      );
+
+      // Profiles should be disabled, not casually deleted from the client.
+      allow delete: if isOwner();
+    }
+
+    // ---------- Public lead form ----------
+    // Public form is intentionally limited. Apply App Check / rate limiting
+    // in a trusted backend too; Firestore rules are not a rate limiter.
+    match /leads/{leadId} {
+      allow create: if request.resource.data.keys().hasOnly([
+          'name', 'email', 'service', 'message', 'createdAt', 'status'
+        ])
+        && request.resource.data.keys().hasAll([
+          'name', 'email', 'service', 'message', 'createdAt', 'status'
+        ])
+        && request.resource.data.name is string
+        && request.resource.data.name.size() >= 2
+        && request.resource.data.name.size() <= 80
+        && request.resource.data.email is string
+        && request.resource.data.email.size() <= 254
+        && request.resource.data.service is string
+        && request.resource.data.service.size() <= 100
+        && request.resource.data.message is string
+        && request.resource.data.message.size() >= 10
+        && request.resource.data.message.size() <= 2000
+        && request.resource.data.status == 'new'
+        && request.resource.data.createdAt == request.time;
+
+      allow get, list, update, delete: if isStaff();
+    }
+
+    // ---------- Product catalog ----------
+    match /products/{productId} {
+      allow get, list: if resource.data.active == true || isStaff();
+      allow create, update, delete: if isAdmin();
+    }
+
+    // ---------- Orders ----------
+    // Preferred design: order creation and all financial/status changes
+    // are performed by Cloud Functions/Admin SDK after server validation.
+    match /orders/{orderId} {
+      allow get, list: if isSelf(resource.data.uid) || isStaff();
+      allow create, update, delete: if false; // All order writes go through validated Cloud Functions.
+
+      // Message documents are separate from the order document. This avoids
+      // clients rewriting an entire msgs[] array to spoof or erase history.
+      match /messages/{messageId} {
+        allow get, list: if isSelf(get(/databases/$(database)/documents/orders/$(orderId)).data.uid)
+                         || isStaff();
+
+        allow create: if signedIn()
+          && request.resource.data.keys().hasOnly([
+            'senderUid', 'senderRole', 'text', 'createdAt'
+          ])
+          && request.resource.data.keys().hasAll([
+            'senderUid', 'senderRole', 'text', 'createdAt'
+          ])
+          && request.resource.data.senderUid == request.auth.uid
+          && request.resource.data.senderRole == 'client'
+          && request.resource.data.text is string
+          && request.resource.data.text.size() >= 1
+          && request.resource.data.text.size() <= 1000
+          && request.resource.data.createdAt == request.time
+          && isSelf(get(/databases/$(database)/documents/orders/$(orderId)).data.uid);
+
+        allow update, delete: if isOwner();
+      }
+    }
+
+    // ---------- Transfers / payment receipts ----------
+    // Client transfer creation should go through a callable Cloud Function:
+    // validate order ownership, amount, reference, receipt path and duplicate refs.
+    // Only the server should approve/reject and create ledger entries.
+    match /transfers/{transferId} {
+      allow get, list: if isSelf(resource.data.uid) || isStaff();
+      allow create, update, delete: if false; // Transfer records are server-managed only.
+    }
+
+    // Immutable ledger: no client writes. Cloud Functions using Admin SDK
+    // write validated entries; Admin SDK bypasses rules, so validate server-side.
+    match /ledger/{entryId} {
+      allow get, list: if isSelf(resource.data.uid) || isAdmin();
+      allow create, update, delete: if false;
+    }
+
+    // ---------- Support conversations ----------
+    match /support/{uid} {
+      allow get, list: if isSelf(uid) || isStaff();
+
+      // Conversation shell is created by the customer, with no privileged fields.
+      allow create: if isSelf(uid)
+        && request.resource.data.keys().hasOnly(['uid', 'createdAt', 'status'])
+        && request.resource.data.keys().hasAll(['uid', 'createdAt', 'status'])
+        && request.resource.data.uid == uid
+        && request.resource.data.createdAt == request.time
+        && request.resource.data.status == 'open';
+
+      // Assignment, status, internal notes and staff metadata are staff-only.
+      allow update, delete: if isStaff();
+
+      match /messages/{messageId} {
+        allow get, list: if isSelf(uid) || isStaff();
+
+        // Customer messages can only be created as the authenticated customer.
+        allow create: if isSelf(uid)
+          && request.resource.data.keys().hasOnly([
+            'senderUid', 'senderRole', 'text', 'createdAt'
+          ])
+          && request.resource.data.keys().hasAll([
+            'senderUid', 'senderRole', 'text', 'createdAt'
+          ])
+          && request.resource.data.senderUid == request.auth.uid
+          && request.resource.data.senderRole == 'client'
+          && request.resource.data.text is string
+          && request.resource.data.text.size() >= 1
+          && request.resource.data.text.size() <= 1000
+          && request.resource.data.createdAt == request.time;
+
+        // Staff replies are created by staff; clients cannot forge staff messages.
+        allow create: if isStaff()
+          && request.resource.data.keys().hasOnly([
+            'senderUid', 'senderRole', 'text', 'createdAt'
+          ])
+          && request.resource.data.keys().hasAll([
+            'senderUid', 'senderRole', 'text', 'createdAt'
+          ])
+          && request.resource.data.senderUid == request.auth.uid
+          && request.resource.data.senderRole in ['staff', 'admin', 'owner']
+          && request.resource.data.text is string
+          && request.resource.data.text.size() >= 1
+          && request.resource.data.text.size() <= 1000
+          && request.resource.data.createdAt == request.time;
+
+        // Message history is append-only. Corrections are new messages.
+        allow update, delete: if false;
+      }
+    }
+
+    // ---------- Deny every collection not explicitly declared above ----------
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}

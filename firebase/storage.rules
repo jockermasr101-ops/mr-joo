@@ -1,0 +1,53 @@
+rules_version = '2';
+
+service firebase.storage {
+  match /b/{bucket}/o {
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    function userDocExists() {
+      return signedIn()
+        && firestore.exists(/databases/(default)/documents/users/$(request.auth.uid));
+    }
+
+    function role() {
+      return firestore.get(/databases/(default)/documents/users/$(request.auth.uid)).data.role;
+    }
+
+    function staff() {
+      return userDocExists() && role() in ['owner', 'admin', 'staff', 'orders', 'accountant', 'support'];
+    }
+
+    // Private customer uploads. Restrict to known paths and modest file sizes.
+    // MIME type is only a hint; scan files server-side before trusting/serving them.
+    match /users/{uid}/uploads/{fileName} {
+      allow write: if signedIn()
+        && request.auth.uid == uid
+        && request.resource != null
+        && request.resource.size < 10 * 1024 * 1024
+        && request.resource.contentType.matches('image/(jpeg|png|webp)|application/pdf');
+      allow read: if signedIn() && (request.auth.uid == uid || staff());
+    }
+
+    // Private payment receipts. The callable validates ownership and records the path.
+    match /receipts/{uid}/{orderId}/{fileName} {
+      allow write: if signedIn()
+        && request.auth.uid == uid
+        && request.resource != null
+        && request.resource.size < 5 * 1024 * 1024
+        && request.resource.contentType.matches('image/(jpeg|png|webp)|application/pdf');
+      allow read: if signedIn() && (request.auth.uid == uid || staff());
+    }
+
+    // Portfolio assets should be uploaded by trusted staff only.
+    match /portfolio/{allPaths=**} {
+      allow read: if true;
+      allow write: if staff();
+    }
+
+    match /{allPaths=**} {
+      allow read, write: if false;
+    }
+  }
+}
